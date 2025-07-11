@@ -3,10 +3,37 @@ import { z } from "zod";
 import { retrieveContext, RAGSource } from "@/app/lib/utils";
 import crypto from "crypto";
 import customerSupportCategories from "@/app/lib/customer_support_categories.json";
+import { generateBedrockResponse } from "@/app/lib/bedrock";
 
-const anthropic = new Anthropic({
+// Define message content types
+type TextContent = {
+  type: "text";
+  text: string;
+};
+
+type ImageContent = {
+  type: "image";
+  source: {
+    type: "base64";
+    media_type: string;
+    data: string;
+  };
+};
+
+type MessageContent = TextContent | ImageContent;
+
+type Message = {
+  role: "user" | "assistant";
+  content: string | MessageContent[];
+};
+
+// Check if we should use AWS Bedrock
+const useBedrock = process.env.CLAUDE_CODE_USE_BEDROCK === "1";
+
+// Initialize Anthropic SDK only if not using Bedrock
+const anthropic = !useBedrock ? new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
-});
+}) : null;
 
 // Debug message helper function
 // Input: message string and optional data object
@@ -74,9 +101,24 @@ export async function POST(req: Request) {
 
   // Extract data from the request body
   const { messages, model } = await req.json();
-  const latestMessage = messages[messages.length - 1].content;
+  
+  // Handle the latest message content which might be text or an array with images
+  const lastMessage = messages[messages.length - 1];
+  let latestMessageText = "";
+  
+  if (typeof lastMessage.content === "string") {
+    latestMessageText = lastMessage.content;
+  } else if (Array.isArray(lastMessage.content)) {
+    // Extract text from content array
+    const textBlocks = lastMessage.content.filter(block => 
+      typeof block === "object" && block.type === "text"
+    );
+    if (textBlocks.length > 0) {
+      latestMessageText = textBlocks.map(block => block.text).join(" ");
+    }
+  }
 
-  console.log("📝 Latest Query:", latestMessage);
+  console.log("📝 Latest Query:", latestMessageText || "No text content");
   measureTime("User Input Received");
 
   // Prepare debug data
@@ -84,7 +126,7 @@ export async function POST(req: Request) {
   const debugData = sanitizeHeaderValue(
     debugMessage("🚀 API route called", {
       messagesReceived: messages.length,
-      latestMessageLength: latestMessage.length,
+      latestMessageLength: latestMessageText?.length || 0,
       anthropicKeySlice: process.env.ANTHROPIC_API_KEY?.slice(0, 4) + "****",
     }),
   ).slice(0, MAX_DEBUG_LENGTH);
@@ -96,9 +138,9 @@ export async function POST(req: Request) {
 
   // Attempt to retrieve context from RAG
   try {
-    console.log("🔍 Initiating RAG retrieval for query:", latestMessage);
+    console.log("🔍 Initiating RAG retrieval for query:", latestMessageText || "");
     measureTime("RAG Start");
-    const result = await retrieveContext(latestMessage);
+    const result = await retrieveContext(latestMessageText || "");
     retrievedContext = result.context;
     isRagWorking = result.isRagWorking;
     ragSources = result.ragSources || [];
@@ -115,7 +157,7 @@ export async function POST(req: Request) {
     );
   } catch (error) {
     console.error("💀 RAG Error:", error);
-    console.error("❌ RAG retrieval failed for query:", latestMessage);
+    console.error("❌ RAG retrieval failed for query:", latestMessageText || "");
     retrievedContext = "";
     isRagWorking = false;
     ragSources = [];
@@ -220,32 +262,74 @@ export async function POST(req: Request) {
     console.log(`🚀 Query Processing`);
     measureTime("Claude Generation Start");
 
-    const anthropicMessages = messages.map((msg: any) => ({
-      role: msg.role,
-      content: msg.content,
-    }));
+    const anthropicMessages = messages.map((msg: any) => {
+      // If the content is a string, use it as is
+      if (typeof msg.content === "string") {
+        return {
+          role: msg.role,
+          content: msg.content,
+        };
+      }
+      
+      // If the content is an array (for multimodal messages with images)
+      if (Array.isArray(msg.content)) {
+        return {
+          role: msg.role,
+          content: msg.content,
+        };
+      }
+      
+      // Fallback for any other format
+      return {
+        role: msg.role,
+        content: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content),
+      };
+    });
 
     anthropicMessages.push({
       role: "assistant",
       content: "{",
     });
 
-    const response = await anthropic.messages.create({
-      model: model,
-      max_tokens: 1000,
-      messages: anthropicMessages,
-      system: systemPrompt,
-      temperature: 0.3,
-    });
+    let response;
+    
+    if (useBedrock) {
+      console.log("🚀 Using AWS Bedrock for Claude");
+      response = await generateBedrockResponse({
+        model: model,
+        messages: anthropicMessages,
+        systemPrompt: systemPrompt,
+        maxTokens: 1000,
+        temperature: 0.3,
+      });
+    } else {
+      console.log("🚀 Using Anthropic API directly");
+      response = await anthropic.messages.create({
+        model: model,
+        max_tokens: 1000,
+        messages: anthropicMessages,
+        system: systemPrompt,
+        temperature: 0.3,
+      });
+    }
 
     measureTime("Claude Generation Complete");
     console.log("✅ Message generation completed");
 
     // Extract text content from the response
-    const textContent = "{" + response.content
-      .filter((block): block is Anthropic.TextBlock => block.type === "text")
-      .map((block) => block.text)
-      .join(" ");
+    let textContent;
+    
+    if (useBedrock) {
+      textContent = "{" + response.content
+        .filter((block) => block.type === "text")
+        .map((block) => block.text)
+        .join(" ");
+    } else {
+      textContent = "{" + response.content
+        .filter((block): block is Anthropic.TextBlock => block.type === "text")
+        .map((block) => block.text)
+        .join(" ");
+    }
 
     // Parse the JSON response
     let parsedResponse;

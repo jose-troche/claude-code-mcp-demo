@@ -7,6 +7,10 @@ import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import ReactMarkdown from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import rehypeRaw from "rehype-raw";
+import remarkGfm from "remark-gfm";
+import { cn } from "@/lib/utils";
+import CodeBlock from "./CodeBlock";
+import FileUpload from "./FileUpload";
 import {
   HandHelping,
   WandSparkles,
@@ -14,8 +18,12 @@ import {
   BookOpenText,
   ChevronDown,
   Send,
+  PaperclipIcon,
+  ImageIcon,
+  X,
 } from "lucide-react";
 import "highlight.js/styles/atom-one-dark.css";
+import "@/styles/markdown.css";
 import { Card, CardContent, CardFooter } from "@/components/ui/card";
 import { Textarea } from "@/components/ui/textarea";
 import Image from "next/image";
@@ -119,7 +127,7 @@ const MessageContent = ({
   content,
   role,
 }: {
-  content: string;
+  content: string | MessageContent[];
   role: string;
 }) => {
   const [thinking, setThinking] = useState(true);
@@ -144,17 +152,46 @@ const MessageContent = ({
     }, 30000);
 
     try {
-      const result = JSON.parse(content);
-      console.log("🔍 Parsed Result:", result);
+      // Handle string content
+      if (typeof content === 'string') {
+        const result = JSON.parse(content);
+        console.log("🔍 Parsed Result:", result);
 
-      if (
-        result.response &&
-        result.response.length > 0 &&
-        result.response !== "..."
-      ) {
-        setParsed(result);
-        setThinking(false);
-        clearTimeout(timer);
+        if (
+          result.response &&
+          result.response.length > 0 &&
+          result.response !== "..."
+        ) {
+          setParsed(result);
+          setThinking(false);
+          clearTimeout(timer);
+        }
+      } 
+      // Handle array content (multimodal messages)
+      else if (Array.isArray(content)) {
+        // Extract text content from array
+        const textBlocks = content.filter(block => 
+          block.type === "text"
+        );
+        
+        if (textBlocks.length > 0) {
+          const textContent = textBlocks.map(block => block.text).join(" ");
+          try {
+            const result = JSON.parse(textContent);
+            setParsed(result);
+            setThinking(false);
+            clearTimeout(timer);
+          } catch (innerError) {
+            console.error("Error parsing text content:", innerError);
+            // Fallback to displaying the raw text
+            setParsed({ response: textContent });
+            setThinking(false);
+            clearTimeout(timer);
+          }
+        } else {
+          setError(true);
+          setThinking(false);
+        }
       }
     } catch (error) {
       console.error("Error parsing JSON:", error);
@@ -180,8 +217,53 @@ const MessageContent = ({
 
   return (
     <>
-      <ReactMarkdown rehypePlugins={[rehypeRaw, rehypeHighlight]}>
-        {parsed.response || content}
+      <ReactMarkdown
+        className="markdown"
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[rehypeRaw, rehypeHighlight]}
+        components={{
+          code({ node, inline, className, children, ...props }) {
+            const match = /language-(.+)/.exec(className || "");
+            if (inline) {
+              return (
+                <code className={className} {...props}>
+                  {children}
+                </code>
+              );
+            }
+            return (
+              <CodeBlock
+                language={match ? match[1] : ""}
+                value={String(children).replace(/\n$/, "")}
+                className={className}
+                {...props}
+              />
+            );
+          },
+          a({ node, className, children, ...props }) {
+            return (
+              <a
+                className={cn("text-blue-600 hover:text-blue-800", className)}
+                target="_blank"
+                rel="noopener noreferrer"
+                {...props}
+              >
+                {children}
+              </a>
+            );
+          },
+          table({ className, children, ...props }) {
+            return (
+              <div className="overflow-x-auto my-4">
+                <table className={cn("w-full border-collapse", className)} {...props}>
+                  {children}
+                </table>
+              </div>
+            );
+          },
+        }}
+      >
+        {typeof parsed.response === 'string' ? parsed.response : (typeof content === 'string' ? content : JSON.stringify(content))}
       </ReactMarkdown>
       {parsed.redirect_to_agent && (
         <UISelector redirectToAgent={parsed.redirect_to_agent} />
@@ -194,12 +276,24 @@ const MessageContent = ({
 type Model = {
   id: string;
   name: string;
+  description?: string;
+  capability?: string;
+};
+
+type MessageContent = {
+  type: string;
+  text?: string;
+  source?: {
+    type: string;
+    media_type: string;
+    data: string;
+  };
 };
 
 interface Message {
   id: string;
   role: string;
-  content: string;
+  content: string | MessageContent[];
 }
 
 // Define the props interface for ConversationHeader
@@ -244,8 +338,13 @@ const ConversationHeader: React.FC<ConversationHeaderProps> = ({
             size="sm"
             className="flex-grow text-muted-foreground sm:flex-grow-0"
           >
-            {models.find((m) => m.id === selectedModel)?.name}
-            <ChevronDown className="ml-2 h-4 w-4" />
+            <div className="flex items-center">
+              <div className="flex flex-col items-start mr-2">
+                <span>{models.find((m) => m.id === selectedModel)?.name}</span>
+                <span className="text-xs">{models.find((m) => m.id === selectedModel)?.capability}</span>
+              </div>
+              <ChevronDown className="h-4 w-4" />
+            </div>
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent>
@@ -254,7 +353,12 @@ const ConversationHeader: React.FC<ConversationHeaderProps> = ({
               key={model.id}
               onSelect={() => setSelectedModel(model.id)}
             >
-              {model.name}
+              <div className="flex flex-col">
+                <span className="font-medium">{model.name}</span>
+                {model.description && (
+                  <span className="text-xs text-muted-foreground">{model.description}</span>
+                )}
+              </div>
             </DropdownMenuItem>
           ))}
         </DropdownMenuContent>
@@ -268,19 +372,20 @@ function ChatArea() {
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [showHeader, setShowHeader] = useState(false);
-  const [selectedModel, setSelectedModel] = useState("claude-3-5-sonnet-20240620");
+  const [selectedModel, setSelectedModel] = useState("claude-sonnet-4-20250514");
   const [showAvatar, setShowAvatar] = useState(false);
+  const [imageData, setImageData] = useState<string | null>(null);
+  const [showImageUpload, setShowImageUpload] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const models: Model[] = [
-    { id: "claude-3-haiku-20240307", name: "Claude 3 Haiku" },
-    { id: "claude-3-5-sonnet-20240620", name: "Claude 3.5 Sonnet" },
+    { id: "claude-3-5-haiku-20241022", name: "Claude 3.5 Haiku", description: "Fast responses, great for simple tasks", capability: "Speed" },
+    { id: "claude-3-5-sonnet-20240620", name: "Claude 3.5 Sonnet", description: "Balanced performance for most tasks", capability: "Balanced" },
+    { id: "claude-sonnet-4-20250514", name: "Claude 4 Sonnet", description: "Most capable model for complex tasks", capability: "Powerful" },
   ];
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  };
+  // Scroll handling is now done in the useEffect
 
   useEffect(() => {
     console.log("🔍 Messages changed! Count:", messages.length);
@@ -369,10 +474,37 @@ function ChatArea() {
     const clientStart = performance.now();
     console.log("🔄 Starting request: " + new Date().toISOString());
 
+    const messageContent = typeof event === "string" ? event : input;
+
+    // Prepare message content - with or without image
+    let userMessageContent: string | MessageContent[];
+
+    if (imageData) {
+      // Extract MIME type from base64 string
+      const mimeMatch = imageData.match(/^data:([^;]+);base64,/);
+      const mimeType = mimeMatch ? mimeMatch[1] : "image/jpeg";
+      const base64Data = imageData.split(",")[1];
+
+      // Create multimodal content array
+      userMessageContent = [
+        { type: "text", text: messageContent },
+        { 
+          type: "image", 
+          source: {
+            type: "base64",
+            media_type: mimeType,
+            data: base64Data
+          }
+        }
+      ];
+    } else {
+      userMessageContent = messageContent;
+    }
+
     const userMessage = {
       id: crypto.randomUUID(),
       role: "user",
-      content: typeof event === "string" ? event : input,
+      content: userMessageContent,
     };
 
     const placeholderMessage = {
@@ -394,6 +526,8 @@ function ChatArea() {
       placeholderMessage,
     ]);
     setInput("");
+    setImageData(null);
+    setShowImageUpload(false);
 
     const placeholderDisplayed = performance.now();
     logDuration("Perceived Latency", placeholderDisplayed - clientStart);
@@ -538,7 +672,7 @@ function ChatArea() {
           models={models}
           showAvatar={showAvatar}
         />
-        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        <div className="flex-1 overflow-y-auto overflow-x-hidden p-4 space-y-4 w-full">
           {messages.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-full animate-fade-in-up">
               <Avatar className="w-10 h-10 mb-4 border">
@@ -577,9 +711,9 @@ function ChatArea() {
               </div>
             </div>
           ) : (
-            <div className="space-y-4">
+            <div className="space-y-4 w-full">
               {messages.map((message, index) => (
-                <div key={message.id}>
+                <div key={message.id} className="w-full">
                   <div
                     className={`flex items-start ${
                       message.role === "user" ? "justify-end" : ""
@@ -592,7 +726,7 @@ function ChatArea() {
                     }}
                   >
                     {message.role === "assistant" && (
-                      <Avatar className="w-8 h-8 mr-2 border">
+                      <Avatar className="w-8 h-8 mr-2 border flex-shrink-0">
                         <AvatarImage
                           src="/ant-logo.svg"
                           alt="AI Assistant Avatar"
@@ -601,7 +735,7 @@ function ChatArea() {
                       </Avatar>
                     )}
                     <div
-                      className={`p-3 rounded-md text-sm max-w-[65%] ${
+                      className={`p-3 rounded-md text-sm max-w-[90%] md:max-w-[75%] lg:max-w-[65%] overflow-hidden break-words ${
                         message.role === "user"
                           ? "bg-primary text-primary-foreground"
                           : "bg-muted border"
@@ -635,6 +769,14 @@ function ChatArea() {
           onSubmit={handleSubmit}
           className="flex flex-col w-full relative bg-background border rounded-xl focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2"
         >
+          {showImageUpload && (
+            <div className="px-3 pt-3">
+              <FileUpload 
+                onImageUpload={setImageData} 
+                maxFileSizeMB={5}
+              />
+            </div>
+          )}
           <Textarea
             value={input}
             onChange={handleInputChange}
@@ -645,7 +787,7 @@ function ChatArea() {
             rows={1}
           />
           <div className="flex justify-between items-center p-3">
-            <div>
+            <div className="flex items-center space-x-2">
               <Image
                 src="/claude-icon.svg"
                 alt="Claude Icon"
@@ -653,10 +795,29 @@ function ChatArea() {
                 height={14}
                 className="w-auto h-[14px] mt-1"
               />
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8"
+                onClick={() => setShowImageUpload(!showImageUpload)}
+                title={showImageUpload ? "Close image upload" : "Upload screenshot"}
+              >
+                {showImageUpload ? (
+                  <X className="h-4 w-4" />
+                ) : (
+                  <ImageIcon className="h-4 w-4" />
+                )}
+              </Button>
+              {imageData && (
+                <span className="text-xs text-muted-foreground">
+                  Screenshot attached
+                </span>
+              )}
             </div>
             <Button
               type="submit"
-              disabled={isLoading || input.trim() === ""}
+              disabled={isLoading || (input.trim() === "" && !imageData)}
               className="gap-2"
               size="sm"
             >
